@@ -1,0 +1,152 @@
+name: Build av-16.0.1-cp314-win_arm64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: av-16.0.1-cp314-win_arm64
+    runs-on: windows-11-arm
+
+    env:
+      CIBW_ARCHS: "ARM64"
+      CIBW_BUILD: "cp314-win_arm64"
+      CIBW_BUILD_VERBOSITY: "1"
+
+      # Same FFmpeg setup approach as PyAV 17.0.0
+      CIBW_BEFORE_BUILD_WINDOWS: >-
+        python scripts\fetch-vendor.py
+        --config-file scripts\ffmpeg-8.0.json
+        C:\cibw\vendor
+
+      CIBW_ENVIRONMENT_WINDOWS: >-
+        INCLUDE=C:\\cibw\\vendor\\include
+        LIB=C:\\cibw\\vendor\\lib
+        PYAV_SKIP_TESTS=unicode_filename
+
+      # Bundle FFmpeg DLLs into the wheel
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+        delvewheel repair
+        --add-path C:\cibw\vendor\bin
+        -w {dest_dir}
+        {wheel}
+
+      CIBW_TEST_COMMAND: >-
+        python -c "import av;
+        assert av.__version__ == '16.0.1';
+        print(av.__version__);
+        print(av.library_versions)"
+
+    steps:
+      # Actual package sources: PyAV 16.0.1
+      - name: Checkout PyAV 16.0.1
+        uses: actions/checkout@v4
+        with:
+          repository: PyAV-Org/PyAV
+          ref: v16.0.1
+          persist-credentials: false
+
+      # Get the ARM64-aware FFmpeg fetcher from PyAV 17.0.0
+      - name: Checkout PyAV 17.0.0 build scripts
+        uses: actions/checkout@v4
+        with:
+          repository: PyAV-Org/PyAV
+          ref: v17.0.0
+          path: pyav17
+          persist-credentials: false
+
+      - name: Apply Windows ARM64 FFmpeg support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Copy-Item `
+            pyav17/scripts/fetch-vendor.py `
+            scripts/fetch-vendor.py -Force
+
+          Copy-Item `
+            pyav17/scripts/ffmpeg-8.0.json `
+            scripts/ffmpeg-8.0.json -Force
+
+          Remove-Item pyav17 -Recurse -Force
+
+          Write-Host "Using PyAV 17 FFmpeg fetcher"
+          Get-Content scripts/ffmpeg-8.0.json
+
+      - name: Set up Python 3.14 ARM64
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          architecture: arm64
+
+      - name: Verify environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python --version
+          python -c "import platform; print(platform.machine())"
+
+          if ($env:PROCESSOR_ARCHITECTURE -ne "ARM64") {
+            throw "Expected Windows ARM64"
+          }
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+
+          python -m pip install `
+            "cibuildwheel>=3.1.2,<4" `
+            delvewheel
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install build dependencies"
+          }
+
+      - name: Build wheels
+        shell: pwsh
+        run: |
+          python -m cibuildwheel `
+            --platform windows `
+            --output-dir dist
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyAV wheel build failed"
+          }
+
+      - name: Verify resulting wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $wheels = @(
+            Get-ChildItem dist -Filter "*.whl"
+          )
+
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one wheel"
+          }
+
+          $wheel = $wheels[0]
+
+          Write-Host "Built: $($wheel.Name)"
+
+          if ($wheel.Name -notmatch "^av-16\.0\.1-") {
+            throw "Unexpected PyAV version"
+          }
+
+          if ($wheel.Name -notmatch "cp314.*win_arm64\.whl$") {
+            throw "Unexpected Python/platform tag"
+          }
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: av-16.0.1-cp314-cp314-win_arm64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30

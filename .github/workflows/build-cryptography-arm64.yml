@@ -1,0 +1,161 @@
+name: Build cryptography-cp311-win_arm64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: cryptography-${{ matrix.version }}-cp311-win_arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        version:
+          - "46.0.5"
+          - "46.0.7"
+          - "47.0.0"
+          - "48.0.0"
+          - "48.0.1"
+          - "50.0.1"
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout cryptography
+        uses: actions/checkout@v4
+        with:
+          repository: pyca/cryptography
+          ref: ${{ matrix.version }}
+          persist-credentials: false
+
+      - name: Setup Python ARM64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: arm64
+
+      - name: Verify environment
+        run: |
+          python -c "import platform; assert platform.machine().lower() in ('arm64', 'aarch64')"
+          python --version
+          rustc --version
+          cargo --version
+
+      - name: Setup Rust ARM64
+        run: |
+          rustup target add aarch64-pc-windows-msvc
+          "CARGO_BUILD_TARGET=aarch64-pc-windows-msvc" >> $env:GITHUB_ENV
+
+      - name: Clone vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
+
+          & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg bootstrap failed"
+          }
+
+      - name: Build OpenSSL ARM64
+        run: |
+          & C:\vcpkg\vcpkg.exe install openssl:arm64-windows-static-md
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenSSL build failed"
+          }
+
+      - name: Configure OpenSSL
+        run: |
+          $openssl = "C:\vcpkg\installed\arm64-windows-static-md"
+
+          if (!(Test-Path "$openssl\lib\libcrypto.lib")) {
+            throw "ARM64 OpenSSL not found"
+          }
+
+          "OPENSSL_DIR=$openssl" >> $env:GITHUB_ENV
+          "OPENSSL_LIB_DIR=$openssl\lib" >> $env:GITHUB_ENV
+          "OPENSSL_INCLUDE_DIR=$openssl\include" >> $env:GITHUB_ENV
+          "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+          "OPENSSL_NO_VENDOR=1" >> $env:GITHUB_ENV
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip build wheel
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installing build tools failed"
+          }
+
+      - name: Build wheel
+        run: |
+          python -m build --wheel --outdir dist
+          if ($LASTEXITCODE -ne 0) {
+            throw "Wheel build failed"
+          }
+
+      - name: Validate wheel filename
+        env:
+          EXPECTED_VERSION: ${{ matrix.version }}
+        run: |
+          $wheels = @(Get-ChildItem dist -Filter "cryptography-*.whl")
+
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one wheel, found $($wheels.Count)"
+          }
+
+          $wheel = $wheels[0]
+          $expectedPrefix = "cryptography-$env:EXPECTED_VERSION-"
+
+          if (-not $wheel.Name.StartsWith($expectedPrefix)) {
+            throw "Wrong version in wheel: $($wheel.Name)"
+          }
+
+          if ($wheel.Name -notmatch "win_arm64\.whl$") {
+            throw "Not an ARM64 wheel: $($wheel.Name)"
+          }
+
+          Write-Host "Built: $($wheel.Name)" -ForegroundColor Green
+
+      - name: Smoke test wheel
+        env:
+          EXPECTED_VERSION: ${{ matrix.version }}
+        run: |
+          python -m venv testenv
+
+          $python = ".\testenv\Scripts\python.exe"
+          $wheel = (Get-ChildItem dist\cryptography-*.whl |
+            Select-Object -First 1).FullName
+
+          # Install local wheel and dependencies
+          & $python -m pip install $wheel
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Wheel installation failed"
+          }
+
+          # Verify installed version and architecture
+          & $python -c "import platform, cryptography, cffi; assert cryptography.__version__ == '$env:EXPECTED_VERSION'; assert platform.machine().lower() in ('arm64', 'aarch64'); print('cryptography:', cryptography.__version__); print('cffi:', cffi.__version__)"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Package validation failed"
+          }
+
+          # Verify native Rust extension and OpenSSL
+          & $python -c "from cryptography.hazmat.backends.openssl.backend import backend; print('OpenSSL:', backend.openssl_version_text())"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenSSL smoke test failed"
+          }
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptography-${{ matrix.version }}-cp311-win_arm64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
