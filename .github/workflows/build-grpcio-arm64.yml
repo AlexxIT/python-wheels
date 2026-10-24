@@ -1,0 +1,197 @@
+
+name: Build grpcio-cp314-win_arm64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: grpcio-${{ matrix.version }}-cp314-win_arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - "1.84.1"
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      GRPCIO_VERSION: ${{ matrix.version }}
+      GRPC_PYTHON_BUILD_WITH_CYTHON: "0"
+      GRPC_PYTHON_BUILD_SYSTEM_OPENSSL: "0"
+      GRPC_PYTHON_BUILD_SYSTEM_ZLIB: "0"
+      GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS: "2"
+      GRPC_PYTHON_BUILD_USE_SHORT_TEMP_DIR_NAME: "1"
+      GRPC_PYTHON_CFLAGS: "/std:c++17 /std:c11 /MT /Zc:preprocessor"
+
+    steps:
+      - name: Setup Python ARM64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          architecture: arm64
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) {
+            throw "pip upgrade failed"
+          }
+
+          python -m pip install --only-binary=:all: `
+            "setuptools<81" wheel packaging
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build dependency installation failed"
+          }
+
+      - name: Download grpcio source archive
+        run: |
+          New-Item -ItemType Directory -Force source | Out-Null
+
+          @'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import urlopen
+
+          version = os.environ["GRPCIO_VERSION"]
+          api = f"https://pypi.org/pypi/grpcio/{version}/json"
+
+          with urlopen(api) as response:
+              info = json.load(response)
+
+          filename = f"grpcio-{version}.tar.gz"
+          entry = next(
+              item for item in info["urls"]
+              if item["filename"] == filename
+          )
+
+          with urlopen(entry["url"]) as response:
+              data = response.read()
+
+          digest = hashlib.sha256(data).hexdigest()
+
+          if digest != entry["digests"]["sha256"]:
+              raise RuntimeError("SHA256 mismatch")
+
+          Path("source", filename).write_bytes(data)
+          print(f"Downloaded {filename}")
+          '@ | Set-Content download.py -Encoding utf8
+
+          python download.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "Download failed"
+          }
+
+          tar -xzf "source/grpcio-$env:GRPCIO_VERSION.tar.gz"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Extraction failed"
+          }
+
+      - name: Patch MSVC flags
+        run: |
+          @'
+          import os
+          from pathlib import Path
+
+          version = os.environ["GRPCIO_VERSION"]
+          path = Path(
+              f"grpcio-{version}/src/python/grpcio/commands.py"
+          )
+
+          source = path.read_text(encoding="utf-8")
+
+          old = '''cpp_specific_args = {"-std=c++17", "-stdlib=libc++"}
+                      c_specific_args = {"-std=c11"}'''
+
+          new = '''cpp_specific_args = {
+                          "-std=c++17",
+                          "-stdlib=libc++",
+                          "/std:c++17",
+                      }
+                      c_specific_args = {
+                          "-std=c11",
+                          "/std:c11",
+                      }'''
+
+          if source.count(old) != 1:
+              raise RuntimeError(
+                  "Compiler flags block not found"
+              )
+
+          path.write_text(
+              source.replace(old, new, 1),
+              encoding="utf-8"
+          )
+
+          print("MSVC flags patched")
+          '@ | Set-Content patch.py -Encoding utf8
+
+          python patch.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "Patch failed"
+          }
+
+      - name: Build grpcio wheel
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          python -m pip wheel `
+            --no-build-isolation `
+            --no-deps `
+            --no-cache-dir `
+            --wheel-dir dist `
+            "./grpcio-$env:GRPCIO_VERSION"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "grpcio build failed"
+          }
+
+      - name: Verify wheel
+        run: |
+          $wheels = @(Get-ChildItem dist -Filter "*.whl")
+
+          if ($wheels.Count -ne 1) {
+            throw "Expected one wheel, found $($wheels.Count)"
+          }
+
+          $expected = "grpcio-$env:GRPCIO_VERSION-cp314-cp314-win_arm64.whl"
+
+          if ($wheels[0].Name -ne $expected) {
+            throw "Unexpected wheel: $($wheels[0].Name)"
+          }
+
+          Write-Host "Built: $expected"
+
+      - name: Test wheel
+        run: |
+          $wheel = (Get-ChildItem dist -Filter "*.whl")[0]
+
+          python -m pip install --force-reinstall $wheel.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installation failed"
+          }
+
+          python -c "import grpc, os; import grpc._cython.cygrpc; assert grpc.__version__ == os.environ['GRPCIO_VERSION']; print('grpcio ARM64 OK')"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Import test failed"
+          }
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: grpcio-${{ matrix.version }}-cp314-win_arm64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
